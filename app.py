@@ -16,12 +16,12 @@ from pptx import Presentation
 import requests
 
 from supabase_db import db
-from main import generate_marketing_assets_stream_supabase, generate_marketing_assets_supabase
+from main import generate_marketing_assets, generate_marketing_assets_stream
 
 app = FastAPI(
     title="Marketing Generator API",
-    description="Generate marketing assets from PPTX or website content",
-    version="2.0.0"
+    description="Generate marketing assets with TRUE PARALLEL image generation",
+    version="3.0.0"
 )
 
 # Serve local images if needed
@@ -124,27 +124,32 @@ def extract_text_from_url_sync(url: str):
 async def index():
     return JSONResponse(
         content={
-            "message": "🚀 Marketing Generator API",
-            "version": "2.0.0",
+            "message": "🚀 Marketing Generator API v3.0",
+            "version": "3.0.0",
             "status": "running",
             "features": [
+                "TRUE PARALLEL image generation",
+                "All images start simultaneously",
+                "No timeouts - Let A2E work at its pace",
                 "PPTX content extraction",
                 "Website content scraping", 
                 "Marketing brief generation",
                 "Creative angles generation",
                 "Email copy generation",
                 "Image prompt generation",
-                "Parallel image generation (A2E)",
                 "Supabase storage integration"
             ],
             "endpoints": {
-                "POST /api/generate": "Generate all assets at once",
-                "POST /api/generate-stream": "Stream generation progress",
+                "POST /api/generate": "Generate all assets at once (TRUE PARALLEL)",
+                "POST /api/generate-stream": "Stream generation progress (TRUE PARALLEL)",
                 "GET /api/generations": "Get user's generations",
-                "GET /api/generations/{id}": "Get specific generation",
-                "GET /api/status/{id}": "Check generation status"
+                "GET /api/generations/{id}": "Get specific generation"
             },
-            "storage": "Supabase + Local fallback"
+            "performance": {
+                "parallel_mode": "TRUE PARALLEL",
+                "timeouts": "None - Let A2E complete naturally",
+                "strategy": "All images start together, wait for all"
+            }
         }
     )
 
@@ -155,24 +160,10 @@ async def health_check():
         "status": "healthy",
         "timestamp": time.time(),
         "datetime": datetime.now().isoformat(),
-        "service": "marketing-generator"
+        "service": "marketing-generator",
+        "version": "3.0.0",
+        "mode": "TRUE_PARALLEL"
     }
-
-@app.get("/api/test")
-async def test_endpoint():
-    """Test endpoint for debugging"""
-    return {
-        "status": "ok",
-        "supabase_connected": db._get_client() is not None,
-        "memory_generations": len(db._memory_generations),
-        "memory_images": len(db._memory_images)
-    }
-
-async def get_user_id(x_user_id: Optional[str] = Header(None)):
-    """Get user ID from header or use default"""
-    if x_user_id:
-        return x_user_id
-    return "demo-user"
 
 @app.post("/api/generate")
 async def generate_api(
@@ -182,8 +173,15 @@ async def generate_api(
     x_user_id: Optional[str] = Header(None)
 ):
     """
-    Generate all marketing assets at once
+    🚀 GENERATE MODE: TRUE PARALLEL image generation
     
+    Features:
+    - All images start SIMULTANEOUSLY
+    - NO TIMEOUTS - Let A2E complete naturally
+    - Brief + Email + All images in parallel
+    - Returns everything at once when complete
+    
+    Parameters:
     - website_url: Optional website URL to scrape content from
     - ppt_file: Optional PPTX file upload
     - image_count: Number of images to generate (1-5)
@@ -192,11 +190,12 @@ async def generate_api(
     start_time = time.time()
     user_id = x_user_id or "demo-user"
     
-    print(f"\n🎯 GENERATION REQUEST")
+    print(f"\n🚀 GENERATION REQUEST (TRUE PARALLEL)")
     print(f"   User: {user_id}")
     print(f"   Website: {website_url}")
     print(f"   PPT File: {ppt_file.filename if ppt_file else 'None'}")
     print(f"   Images: {image_count}")
+    print(f"   Mode: TRUE PARALLEL (all start together)")
     
     website_text = ""
     ppt_text = ""
@@ -230,15 +229,16 @@ async def generate_api(
         )
         
         print(f"   Generation ID: {generation_id}")
+        print(f"   Strategy: ALL {image_count} IMAGES START TOGETHER")
         
         try:
-            # Limit image count for performance
+            # Limit image count for sanity
             actual_image_count = min(max(1, image_count), 5)
             if actual_image_count != image_count:
                 print(f"   ⚠️  Adjusted image count to {actual_image_count} (max 5)")
             
-            # Run generation
-            results = await generate_marketing_assets_supabase(
+            # Run TRUE PARALLEL generation
+            results = await generate_marketing_assets(
                 ppt_text=ppt_text,
                 website_text=website_text,
                 user_id=user_id,
@@ -249,18 +249,22 @@ async def generate_api(
             total_time = time.time() - start_time
             results["generation_time"] = round(total_time, 2)
             
-            print(f"✅ Generation completed in {total_time:.1f}s")
+            print(f"✅ TRUE PARALLEL generation completed in {total_time:.0f}s")
             print(f"   Images generated: {len(results.get('generated_images', []))}")
+            print(f"   Parallel mode: ✅ All images started together")
             
             return {
                 "success": True,
                 "generation_id": generation_id,
                 "user_id": user_id,
+                "mode": "true_parallel",
                 "data": results,
                 "performance": {
                     "total_time": round(total_time, 2),
                     "images_generated": len(results.get('generated_images', [])),
-                    "storage": results.get('performance', {}).get('storage', 'unknown')
+                    "parallel_mode": "true_parallel",
+                    "timeouts": "none",
+                    "strategy": "All images started simultaneously"
                 }
             }
             
@@ -287,21 +291,33 @@ async def generate_stream_api(
     x_user_id: Optional[str] = Header(None)
 ):
     """
-    Stream generation progress in real-time
+    📡 STREAMING MODE: Real-time TRUE PARALLEL progress
     
     Returns NDJSON stream with events:
     - start: Generation started
     - brief: Marketing brief ready
     - email: Email copy ready  
-    - image_start: Image generation starting
+    - image_start: Image generation starting (ALL START TOGETHER)
     - image: Individual image ready
     - complete: All done
-    - error: Something went wrong
+    
+    Features:
+    - All images start SIMULTANEOUSLY
+    - No timeouts
+    - Real-time progress updates
+    
+    Parameters:
+    - website_url: Optional website URL
+    - ppt_file: Optional PPTX file
+    - image_count: Number of images (1-5)
+    - x_user_id: User identifier
     """
     user_id = x_user_id or "demo-user"
     
-    print(f"\n🌀 STREAMING GENERATION REQUEST")
+    print(f"\n📡 STREAMING REQUEST (TRUE PARALLEL)")
     print(f"   User: {user_id}")
+    print(f"   Images: {image_count}")
+    print(f"   Mode: TRUE PARALLEL STREAMING")
     
     try:
         website_text = ""
@@ -326,7 +342,7 @@ async def generate_stream_api(
             website_text=website_text
         )
         
-        # Limit image count
+        # Adjust image count
         actual_image_count = min(max(1, image_count), 5)
         
         async def generate():
@@ -337,12 +353,13 @@ async def generate_stream_api(
                     "timestamp": time.time(),
                     "generation_id": generation_id,
                     "user_id": user_id,
-                    "message": "Starting marketing generation...",
-                    "image_count": actual_image_count
+                    "image_count": actual_image_count,
+                    "mode": "true_parallel",
+                    "message": "Starting TRUE PARALLEL generation (all images start together)..."
                 }) + "\n"
                 
-                # Stream generation
-                async for chunk in generate_marketing_assets_stream_supabase(
+                # Stream TRUE PARALLEL generation
+                async for chunk in generate_marketing_assets_stream(
                     ppt_text=ppt_text,
                     website_text=website_text,
                     user_id=user_id,
@@ -356,7 +373,8 @@ async def generate_stream_api(
                     "type": "complete",
                     "timestamp": time.time(),
                     "generation_id": generation_id,
-                    "message": "Generation completed successfully!"
+                    "mode": "true_parallel",
+                    "message": "TRUE PARALLEL generation completed! All images started together."
                 }) + "\n"
                 
             except Exception as e:
@@ -368,7 +386,8 @@ async def generate_stream_api(
                     "type": "error",
                     "timestamp": time.time(),
                     "message": str(e),
-                    "generation_id": generation_id
+                    "generation_id": generation_id,
+                    "mode": "true_parallel"
                 }) + "\n"
         
         return StreamingResponse(
@@ -378,7 +397,8 @@ async def generate_stream_api(
                 "X-Accel-Buffering": "no",
                 "Cache-Control": "no-cache",
                 "X-Generation-ID": generation_id,
-                "X-User-ID": user_id
+                "X-User-ID": user_id,
+                "X-Mode": "true_parallel"
             }
         )
         
@@ -401,6 +421,7 @@ async def get_user_generations(
                 # Get images for this generation
                 images = db._memory_images.get(gen_id, [])
                 gen_data["images"] = images
+                gen_data["storage"] = "memory"
                 user_generations.append(gen_data)
         
         # Sort by created_at (newest first)
@@ -417,7 +438,7 @@ async def get_user_generations(
             "user_id": user_id,
             "count": len(user_generations),
             "generations": user_generations,
-            "storage": "memory"
+            "mode": "true_parallel"
         }
         
     except Exception as e:
@@ -443,109 +464,14 @@ async def get_generation(
         return {
             "success": True,
             "generation": generation,
-            "storage": generation.get("storage", "unknown")
+            "storage": generation.get("storage", "unknown"),
+            "mode": "true_parallel"
         }
         
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/status/{generation_id}")
-async def get_generation_status(
-    generation_id: str,
-    x_user_id: Optional[str] = Header(None)
-):
-    """Check status of a generation"""
-    try:
-        user_id = x_user_id or "demo-user"
-        
-        generation = db.get_generation(generation_id, user_id)
-        
-        if not generation:
-            raise HTTPException(status_code=404, detail="Generation not found")
-        
-        status_info = {
-            "generation_id": generation_id,
-            "status": generation.get("status", "unknown"),
-            "user_id": generation.get("user_id"),
-            "created_at": generation.get("created_at"),
-            "updated_at": generation.get("updated_at"),
-            "total_images": generation.get("total_images", 0),
-            "completed_images": generation.get("completed_images", 0),
-            "images_count": len(generation.get("images", [])),
-            "storage": generation.get("storage", "unknown")
-        }
-        
-        return {
-            "success": True,
-            "status": status_info
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/generations/{generation_id}")
-async def delete_generation(
-    generation_id: str,
-    x_user_id: Optional[str] = Header(None)
-):
-    """Delete a generation and all its images"""
-    try:
-        user_id = x_user_id or "demo-user"
-        
-        # Check if generation exists and belongs to user
-        generation = db.get_generation(generation_id, user_id)
-        if not generation:
-            raise HTTPException(status_code=404, detail="Generation not found")
-        
-        # Delete from memory storage
-        if generation_id in db._memory_generations:
-            del db._memory_generations[generation_id]
-        
-        if generation_id in db._memory_images:
-            del db._memory_images[generation_id]
-        
-        # TODO: Implement Supabase deletion when using database
-        
-        return {
-            "success": True,
-            "message": f"Generation {generation_id} deleted",
-            "generation_id": generation_id
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/system-info")
-async def system_info():
-    """Get system information and configuration"""
-    import psutil
-    
-    cpu_percent = psutil.cpu_percent(interval=1)
-    memory = psutil.virtual_memory()
-    
-    return {
-        "system": {
-            "cpu_usage_percent": cpu_percent,
-            "memory_usage_percent": memory.percent,
-            "memory_available_gb": round(memory.available / (1024**3), 2),
-            "python_version": os.sys.version
-        },
-        "api": {
-            "max_images": 5,
-            "parallel_generation": True,
-            "storage_backend": "Supabase + Local fallback"
-        },
-        "tables": {
-            "marketing_generations": "Stores generation sessions",
-            "marketing_images": "Stores generated images"
-        }
-    }
 
 # Error handlers
 @app.exception_handler(HTTPException)
@@ -555,7 +481,8 @@ async def http_exception_handler(request, exc):
         content={
             "success": False,
             "error": exc.detail,
-            "status_code": exc.status_code
+            "status_code": exc.status_code,
+            "timestamp": time.time()
         }
     )
 
@@ -566,7 +493,8 @@ async def general_exception_handler(request, exc):
         content={
             "success": False,
             "error": str(exc),
-            "type": type(exc).__name__
+            "type": type(exc).__name__,
+            "timestamp": time.time()
         }
     )
 
@@ -574,10 +502,19 @@ if __name__ == "__main__":
     import uvicorn
     
     print("\n" + "="*60)
-    print("🚀 MARKETING GENERATOR API")
+    print("🚀 MARKETING GENERATOR API v3.0 - TRUE PARALLEL")
     print("="*60)
-    print("Starting server...")
-    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("Core Features:")
+    print("  • TRUE PARALLEL image generation")
+    print("  • ALL images start SIMULTANEOUSLY")
+    print("  • NO TIMEOUTS - Let A2E complete naturally")
+    print("  • Wait for all images to finish")
+    print("="*60)
+    print("Endpoints:")
+    print("  • POST /api/generate - All at once (TRUE PARALLEL)")
+    print("  • POST /api/generate-stream - Stream progress (TRUE PARALLEL)")
+    print("="*60)
+    print(f"Starting server at {datetime.now().strftime('%H:%M:%S')}")
     print("="*60)
     
     # Create required directories
@@ -589,5 +526,5 @@ if __name__ == "__main__":
         port=5000, 
         reload=True,
         log_level="info",
-        timeout_keep_alive=300
+        timeout_keep_alive=600  # Longer timeout for parallel processing
     )

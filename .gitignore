@@ -1,32 +1,30 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Environments
-.env
-.venv
+*.so
+.Python
 env/
 venv/
-ENV/
+.env
+*.env
+.env.local
 
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
-
-# Unit test / coverage reports
-.pytest_cache/
-.tox/
-.coverage
-htmlcov/
-
-# Database (e.g., local SQLite)
-*.sqlite3
-
-# IDEs (optional but recommended)
+# IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Static files
-static
+# OS
+.DS_Store
+Thumbs.db
+
+# Local files
+local_images/
+temp/
+uploads/
+
+# Logs
+*.log
+logs/
