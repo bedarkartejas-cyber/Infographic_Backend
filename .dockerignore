@@ -1,29 +1,78 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
 env/
 venv/
-.venv/
+ENV/
+.venv
+
+# Environment files (never include secrets!)
 .env
-.git/
-.gitignore
-README.md
-*.log
-local_images/*
-!local_images/.gitkeep
-*.pptx
-*.ppt
-.DS_Store
+.env.local
+.env.*.local
+
+# IDE
 .vscode/
 .idea/
-*.db
-*.sqlite3
-test/
-tests/
-coverage/
-htmlcov/
-*.cover
-.hypothesis/
+*.swp
+*.swo
+*~
+
+# Testing
 .pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Documentation
+*.md
+docs/
+README.md
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Local development
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.log
+tmp/
+temp/
+*.tmp
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Deployment files (these are read by platforms, not needed in image)
+railway.json
+render.yaml
+docker-compose.yml
+docker-compose.*.yml
+
+# Local test files
+test_*.py
+*_test.py
+tests/
