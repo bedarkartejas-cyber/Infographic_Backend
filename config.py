@@ -34,18 +34,18 @@ class Config:
     LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
     
     # --- Security ---
-    # In production, change this to your specific frontend URL (e.g., https://myapp.vercel.app)
-    ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    # CRITICAL: Set this to your frontend URL in production
+    ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").strip()
     RATE_LIMIT = int(os.getenv("RATE_LIMIT", "100"))
     
     # --- Performance & Constraints ---
-    MAX_IMAGES = 5  
-    FILE_SIZE_LIMIT = 10 * 1024 * 1024  # 10MB
+    MAX_IMAGES = int(os.getenv("MAX_IMAGES", "5"))
+    FILE_SIZE_LIMIT = int(os.getenv("FILE_SIZE_LIMIT", str(10 * 1024 * 1024)))  # 10MB default
     
     # --- Timeout Settings (Seconds) ---
     # Long timeouts are necessary for parallel image generation tasks
-    REQUEST_TIMEOUT = 300  
-    A2E_TIMEOUT = 600  
+    REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
+    A2E_TIMEOUT = int(os.getenv("A2E_TIMEOUT", "600"))
 
     @classmethod
     def validate(cls):
@@ -54,7 +54,9 @@ class Config:
         Call this during app startup to fail fast if config is missing.
         """
         missing = []
+        warnings = []
         
+        # Critical variables
         required_vars = [
             ("A2E_API_KEY", cls.A2E_API_KEY),
             ("A2E_BASE_URL", cls.A2E_BASE_URL),
@@ -68,17 +70,58 @@ class Config:
             if not value:
                 missing.append(name)
         
+        # Production-specific warnings
+        if cls.ENVIRONMENT == "production":
+            if not cls.ALLOWED_ORIGINS or cls.ALLOWED_ORIGINS == "*":
+                warnings.append("ALLOWED_ORIGINS not set or set to '*' - CORS is wide open!")
+            
+            if cls.PORT == 5000 and "PORT" not in os.environ:
+                warnings.append("PORT not set - using default 5000 (cloud platforms usually set this)")
+        
+        # Fail fast on missing critical vars
         if missing:
-            error_msg = f"PRODUCTION ERROR: Missing required environment variables: {', '.join(missing)}"
+            error_msg = f"❌ CRITICAL: Missing required environment variables: {', '.join(missing)}"
             logger.error(error_msg)
+            logger.error("Set these in your cloud platform's environment variables dashboard")
             raise ValueError(error_msg)
         
-        logger.info(f"Configuration validated successfully in {cls.ENVIRONMENT} mode.")
+        # Log warnings
+        for warning in warnings:
+            logger.warning(f"⚠️  {warning}")
+        
+        # Success message
+        logger.info(f"✅ Configuration validated successfully")
+        logger.info(f"   Environment: {cls.ENVIRONMENT}")
+        logger.info(f"   Port: {cls.PORT}")
+        logger.info(f"   Workers: {cls.WORKERS}")
+        logger.info(f"   Max Images: {cls.MAX_IMAGES}")
+        logger.info(f"   Request Timeout: {cls.REQUEST_TIMEOUT}s")
+        
+        if cls.ALLOWED_ORIGINS and cls.ALLOWED_ORIGINS != "*":
+            logger.info(f"   CORS Origins: {cls.ALLOWED_ORIGINS}")
+        
         return True
+    
+    @classmethod
+    def get_cors_origins(cls):
+        """Parse ALLOWED_ORIGINS into a list"""
+        if not cls.ALLOWED_ORIGINS or cls.ALLOWED_ORIGINS == "*":
+            if cls.ENVIRONMENT == "production":
+                logger.warning("⚠️  Using wildcard CORS in production!")
+            return ["*"]
+        
+        # Split by comma and clean whitespace
+        origins = [origin.strip() for origin in cls.ALLOWED_ORIGINS.split(",")]
+        origins = [origin for origin in origins if origin]  # Remove empty strings
+        
+        return origins if origins else ["*"]
 
 # Global instance
 config = Config()
 
 # Validate configuration on import for fail-fast behavior
-if config.ENVIRONMENT == "production":
+try:
     config.validate()
+except ValueError as e:
+    # Re-raise to prevent app from starting with invalid config
+    raise SystemExit(f"Configuration validation failed: {e}")
