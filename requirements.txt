@@ -9,5 +9,4 @@ supabase
 python-multipart
 uvicorn
 psutil
-slowapi  # For rate limiting
-redis     # Optional for distributed rate limiting
+slowapi
