@@ -1,0 +1,10 @@
+fastapi
+python-pptx
+beautifulsoup4
+requests
+openai
+python-dotenv
+aiohttp
+supabase
+python-multipart
+uvicorn
