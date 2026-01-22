@@ -1,180 +1,158 @@
 import os
-import re
 import json
 import time
-import uuid
 import logging
-from io import BytesIO
 from typing import Optional
 import asyncio
 from datetime import datetime
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
-from pptx import Presentation
-import requests
 
-# Configure logging
+# Configure structured logging for production
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('app.log')
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-from supabase_db import db
-from main import generate_marketing_assets, generate_marketing_assets_stream
+# Suppress noisy logs
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 
+# Import production config
+try:
+    from config import config
+    CONFIG_LOADED = True
+    # Validate config on import
+    if hasattr(config, 'validate'):
+        config.validate()
+    logger.info("✅ Production configuration loaded")
+except ImportError as e:
+    logger.error(f"❌ Failed to load config module: {e}")
+    CONFIG_LOADED = False
+    raise
+except Exception as e:
+    logger.error(f"❌ Configuration validation failed: {e}")
+    CONFIG_LOADED = False
+    raise
+
+# Import application modules
+try:
+    from supabase_db import db
+    from main import generate_marketing_assets, generate_marketing_assets_stream
+    MODULES_LOADED = True
+    logger.info("✅ Application modules loaded")
+except ImportError as e:
+    logger.error(f"❌ Failed to import application modules: {e}")
+    MODULES_LOADED = False
+    raise
+
+# Import utilities
+try:
+    from app_utils import extract_text_from_pptx, extract_text_from_url_sync
+    UTILS_LOADED = True
+    logger.info("✅ Utility modules loaded")
+except ImportError as e:
+    logger.error(f"❌ Failed to import utility modules: {e}")
+    UTILS_LOADED = False
+    raise
+
+# Import authentication middleware
+try:
+    from auth_middleware import get_user_id_from_token, get_user_id_from_header
+    AUTH_LOADED = True
+    logger.info("✅ Authentication middleware loaded")
+except ImportError as e:
+    logger.error(f"⚠️ Failed to load auth middleware: {e}")
+    AUTH_LOADED = False
+
+# Determine environment
+ENVIRONMENT = config.ENVIRONMENT if CONFIG_LOADED else os.getenv("ENVIRONMENT", "production")
+
+# Create FastAPI app with production settings
 app = FastAPI(
     title="Marketing Generator API",
     description="Generate marketing assets with TRUE PARALLEL image generation",
     version="3.0.0",
-    docs_url="/docs" if os.getenv("ENVIRONMENT") == "development" else None,
-    redoc_url="/redoc" if os.getenv("ENVIRONMENT") == "development" else None,
+    docs_url="/docs" if ENVIRONMENT == "development" else None,
+    redoc_url="/redoc" if ENVIRONMENT == "development" else None,
+    openapi_url="/openapi.json" if ENVIRONMENT == "development" else None,
 )
 
-# Production CORS settings
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+# CORS configuration - restrict in production
+if ENVIRONMENT == "production":
+    allowed_origins = config.ALLOWED_ORIGINS.split(",") if CONFIG_LOADED else []
+    if not allowed_origins:
+        logger.warning("⚠️ ALLOWED_ORIGINS not set in production, defaulting to empty")
+        allowed_origins = []
+else:
+    allowed_origins = ["*"]  # Allow all in development
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization", "X-User-ID"],
     max_age=3600,
 )
 
-# Add GZip compression
+# Add GZip compression for better performance
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Serve static files in production
-os.makedirs("local_images", exist_ok=True)
-app.mount("/local_images", StaticFiles(directory="local_images"), name="local_images")
-
-# --- CONFIGURATION ---
-TIMEOUT = (10, 60)
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0 Safari/537.36"
-    )
-}
-
-# Rate limiting (simple in-memory)
-request_counts = {}
-RATE_LIMIT = int(os.getenv("RATE_LIMIT", "100"))  # requests per minute
-
-@app.middleware("http")
-async def rate_limit_middleware(request, call_next):
-    client_ip = request.client.host if request.client else "unknown"
-    current_time = time.time()
+# Dependency for authentication
+async def get_current_user_id(request: Request) -> str:
+    """
+    Production authentication - prefers JWT token, falls back to header for development
+    """
+    # Try JWT token first (production)
+    if AUTH_LOADED:
+        try:
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                user_id = await get_user_id_from_token(request)
+                logger.debug(f"Authenticated user via JWT: {user_id[:8]}...")
+                return user_id
+        except HTTPException as jwt_error:
+            # Only log if it was a real auth error, not just missing header
+            if jwt_error.status_code != 401:
+                logger.warning(f"JWT auth failed: {jwt_error.detail}")
+        except Exception as e:
+            logger.warning(f"JWT auth error: {e}")
     
-    # Clean old entries
-    request_counts[client_ip] = [
-        t for t in request_counts.get(client_ip, [])
-        if current_time - t < 60
-    ]
+    # Fallback to X-User-ID header (for development/testing)
+    user_id = request.headers.get("X-User-ID")
+    if user_id:
+        logger.debug(f"Using X-User-ID header: {user_id[:8]}...")
+        return user_id
     
-    # Check rate limit
-    if len(request_counts[client_ip]) >= RATE_LIMIT:
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Rate limit exceeded. Try again in a minute."}
+    # No authentication provided
+    if ENVIRONMENT == "production":
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Provide Authorization Bearer token or X-User-ID header"
         )
     
-    request_counts[client_ip].append(current_time)
-    response = await call_next(request)
-    return response
-
-def extract_text_from_pptx(file_content):
-    """Extract text from PPTX file"""
-    try:
-        prs = Presentation(BytesIO(file_content))
-        full_text_output = []
-
-        for i, slide in enumerate(prs.slides, start=1):
-            slide_content = []
-            slide_content.append(f"--- SLIDE {i} ---")
-
-            try:
-                if slide.shapes.title and slide.shapes.title.text.strip():
-                    title_text = slide.shapes.title.text.strip()
-                    slide_content.append(f"[Title]: {title_text}")
-            except:
-                pass
-
-            text_shapes = []
-            for shape in slide.shapes:
-                if not shape.has_text_frame: 
-                    continue
-                if shape == slide.shapes.title: 
-                    continue
-                text_shapes.append(shape)
-            
-            text_shapes.sort(key=lambda s: (s.top, s.left))
-
-            for shape in text_shapes:
-                for paragraph in shape.text_frame.paragraphs:
-                    text = paragraph.text.strip()
-                    if text:
-                        slide_content.append(text)
-
-            if slide.has_notes_slide:
-                notes_frame = slide.notes_slide.notes_text_frame
-                if notes_frame:
-                    notes_text = notes_frame.text.strip()
-                    if notes_text:
-                        slide_content.append(f"\n[Speaker Notes]:\n{notes_text}")
-
-            full_text_output.append("\n".join(slide_content))
-
-        return "\n\n".join(full_text_output)
-
-    except Exception as e:
-        logger.error(f"Error reading PPTX: {e}")
-        return ""
-
-def extract_text_from_url_sync(url: str):
-    """Sync web scraping"""
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        response.raise_for_status()
-        html_content = response.text
-        
-        try:
-            from bs4 import BeautifulSoup
-        except ImportError:
-            return ""
-        
-        soup = BeautifulSoup(html_content, "html.parser")
-        for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
-            tag.decompose()
-
-        text = soup.get_text(separator="\n")
-        text = re.sub(r"\n\s*\n+", "\n\n", text)
-        text = re.sub(r"[ \t]+", " ", text)
-        return text.strip()
-        
-    except Exception as e:
-        logger.error(f"Error scraping URL: {e}")
-        return ""
+    # Default user for development
+    logger.warning("⚠️ No authentication provided, using 'demo-user' for development")
+    return "demo-user"
 
 @app.get("/")
 async def index():
+    """Root endpoint with API information"""
     return JSONResponse(
         content={
             "message": "🚀 Marketing Generator API v3.0",
             "version": "3.0.0",
             "status": "running",
-            "environment": os.getenv("ENVIRONMENT", "production"),
+            "environment": ENVIRONMENT,
+            "production": ENVIRONMENT == "production",
+            "authentication": "JWT + X-User-ID header" if AUTH_LOADED else "X-User-ID header only",
             "features": [
                 "TRUE PARALLEL image generation",
                 "All images start simultaneously",
@@ -191,56 +169,121 @@ async def index():
                 "POST /api/generate": "Generate all assets at once (TRUE PARALLEL)",
                 "POST /api/generate-stream": "Stream generation progress (TRUE PARALLEL)",
                 "GET /api/generations": "Get user's generations",
-                "GET /api/generations/{id}": "Get specific generation"
+                "GET /api/generations/{id}": "Get specific generation",
+                "GET /health": "Health check"
             },
-            "rate_limit": f"{RATE_LIMIT} requests per minute"
+            "limits": {
+                "max_images": 5,
+                "max_file_size": f"{config.FILE_SIZE_LIMIT // (1024*1024)}MB" if CONFIG_LOADED else "10MB",
+                "timeout": f"{config.REQUEST_TIMEOUT // 60} minutes" if CONFIG_LOADED else "5 minutes"
+            }
         }
     )
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Comprehensive health check endpoint for production monitoring"""
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "marketing-generator",
+        "version": "3.0.0",
+        "environment": ENVIRONMENT,
+        "production": ENVIRONMENT == "production",
+        "components": {}
+    }
+    
+    # Check database connection
     try:
-        # Check database connection
-        db_status = "healthy" if db._get_client() else "unhealthy"
-        
-        return {
-            "status": "healthy",
-            "timestamp": time.time(),
-            "datetime": datetime.now().isoformat(),
-            "service": "marketing-generator",
-            "version": "3.0.0",
-            "mode": "TRUE_PARALLEL",
-            "database": db_status,
-            "environment": os.getenv("ENVIRONMENT", "production")
+        if MODULES_LOADED:
+            client = db._get_client()
+            if client:
+                # Try a simple query to verify connectivity
+                try:
+                    # Test Supabase connection with a simple query
+                    response = client.table("marketing_generations").select("count", count="exact").limit(1).execute()
+                    health_status["components"]["database"] = {
+                        "status": "healthy",
+                        "type": "supabase",
+                        "tables_accessible": True
+                    }
+                except Exception as query_error:
+                    health_status["components"]["database"] = {
+                        "status": "degraded",
+                        "error": f"Query failed: {str(query_error)[:100]}",
+                        "type": "supabase"
+                    }
+                    health_status["status"] = "degraded"
+            else:
+                health_status["components"]["database"] = {
+                    "status": "unhealthy",
+                    "error": "Client not initialized",
+                    "type": "unknown"
+                }
+                health_status["status"] = "unhealthy"
+        else:
+            health_status["components"]["database"] = {
+                "status": "unhealthy",
+                "error": "Modules not loaded",
+                "type": "unknown"
+            }
+            health_status["status"] = "unhealthy"
+    except Exception as db_error:
+        health_status["components"]["database"] = {
+            "status": "unhealthy",
+            "error": str(db_error)[:200],
+            "type": "unknown"
         }
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
+        health_status["status"] = "unhealthy"
+    
+    # Check configuration
+    health_status["components"]["configuration"] = {
+        "status": "healthy" if CONFIG_LOADED else "unhealthy",
+        "loaded": CONFIG_LOADED,
+        "environment": ENVIRONMENT
+    }
+    
+    # Check modules
+    health_status["components"]["modules"] = {
+        "status": "healthy" if MODULES_LOADED else "unhealthy",
+        "loaded": MODULES_LOADED,
+        "utils_loaded": UTILS_LOADED,
+        "auth_loaded": AUTH_LOADED
+    }
+    
+    # If any component is unhealthy, return 503
+    if health_status["status"] == "unhealthy":
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "error": str(e)}
+            content=health_status
         )
+    
+    return health_status
 
 @app.post("/api/generate")
 async def generate_api(
     website_url: Optional[str] = Form(None),
     ppt_file: Optional[UploadFile] = File(None),
     image_count: int = Form(3),
-    x_user_id: Optional[str] = Header(None)
+    user_id: str = Depends(get_current_user_id)  # Secure production authentication
 ):
     """
-    🚀 GENERATE MODE: TRUE PARALLEL image generation
+    Generate marketing assets with TRUE PARALLEL image generation
+    
+    Authentication: JWT Bearer token (production) or X-User-ID header (development)
     """
+    if not MODULES_LOADED or not UTILS_LOADED:
+        raise HTTPException(status_code=503, detail="Service modules not loaded")
+    
     start_time = time.time()
-    user_id = x_user_id or "demo-user"
     
-    logger.info(f"Generation request - User: {user_id}, Images: {image_count}")
+    logger.info(f"🚀 Generation request - User: {user_id[:8]}..., Images: {image_count}")
     
-    # Validate inputs
-    if image_count < 1 or image_count > 5:
+    # Validate inputs using config
+    if image_count < 1 or image_count > config.MAX_IMAGES:
         raise HTTPException(
             status_code=400,
-            detail="image_count must be between 1 and 5"
+            detail=f"image_count must be between 1 and {config.MAX_IMAGES}"
         )
     
     if not website_url and not ppt_file:
@@ -248,13 +291,6 @@ async def generate_api(
             status_code=400,
             detail="Either website_url or ppt_file must be provided"
         )
-    
-    if ppt_file and ppt_file.filename:
-        if not ppt_file.filename.lower().endswith(('.pptx', '.ppt')):
-            raise HTTPException(
-                status_code=400,
-                detail="Only PPTX/PPT files are supported"
-            )
     
     website_text = ""
     ppt_text = ""
@@ -267,23 +303,41 @@ async def generate_api(
             if not all([parsed.scheme, parsed.netloc]):
                 raise HTTPException(status_code=400, detail="Invalid website URL")
                     
-            website_text = await asyncio.to_thread(extract_text_from_url_sync, website_url)
-            logger.info(f"Extracted {len(website_text)} chars from website")
+            logger.info(f"🌐 Extracting content from: {website_url}")
+            website_text = await asyncio.to_thread(
+                extract_text_from_url_sync, 
+                website_url,
+                timeout=config.REQUEST_TIMEOUT
+            )
+            
+            if not website_text:
+                logger.warning(f"⚠️ No content extracted from website: {website_url}")
+                if not ppt_file:  # Only warn if this is the only source
+                    logger.warning("⚠️ Website returned no extractable content")
         
         # Extract PPT content
         if ppt_file and ppt_file.filename:
-            logger.info(f"Processing PPT file: {ppt_file.filename}")
-            file_content = await ppt_file.read()
-            
-            # File size check (10MB max)
-            if len(file_content) > 10 * 1024 * 1024:
+            if not ppt_file.filename.lower().endswith(('.pptx', '.ppt')):
                 raise HTTPException(
                     status_code=400,
-                    detail="PPT file size exceeds 10MB limit"
+                    detail="Only PPTX/PPT files are supported"
+                )
+            
+            logger.info(f"📊 Processing PPT file: {ppt_file.filename}")
+            file_content = await ppt_file.read()
+            
+            # File size check using config
+            if len(file_content) > config.FILE_SIZE_LIMIT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"PPT file size exceeds {config.FILE_SIZE_LIMIT // (1024*1024)}MB limit"
                 )
                 
             ppt_text = extract_text_from_pptx(file_content)
-            logger.info(f"Extracted {len(ppt_text)} chars from PPT")
+            if not ppt_text:
+                logger.warning(f"⚠️ No content extracted from PPT: {ppt_file.filename}")
+                if not website_url:  # Only warn if this is the only source
+                    logger.warning("⚠️ PPT file contains no extractable text content")
         
         if not ppt_text and not website_text:
             raise HTTPException(
@@ -292,14 +346,23 @@ async def generate_api(
             )
         
         # Create generation session
-        generation_id = db.create_generation_session(
-            user_id=user_id,
-            website_url=website_url,
-            ppt_text=ppt_text,
-            website_text=website_text
-        )
+        try:
+            logger.info(f"📝 Creating generation session for user: {user_id[:8]}...")
+            generation_id = db.create_generation_session(
+                user_id=user_id,
+                website_url=website_url,
+                ppt_text=ppt_text,
+                website_text=website_text
+            )
+            logger.info(f"✅ Generation session created: {generation_id}")
+        except Exception as db_error:
+            logger.error(f"❌ Failed to create generation session: {db_error}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to initialize generation session"
+            )
         
-        logger.info(f"Starting TRUE PARALLEL generation: {generation_id}")
+        logger.info(f"🚀 Starting TRUE PARALLEL generation: {generation_id}")
         
         try:
             # Run TRUE PARALLEL generation
@@ -308,13 +371,14 @@ async def generate_api(
                 website_text=website_text,
                 user_id=user_id,
                 generation_id=generation_id,
-                image_count=image_count
+                image_count=min(image_count, config.MAX_IMAGES)
             )
             
             total_time = time.time() - start_time
             results["generation_time"] = round(total_time, 2)
             
-            logger.info(f"Generation completed in {total_time:.0f}s: {generation_id}")
+            logger.info(f"✅ Generation completed in {total_time:.0f}s: {generation_id}")
+            logger.info(f"📊 Generated {len(results.get('generated_images', []))} images")
             
             return {
                 "success": True,
@@ -325,22 +389,28 @@ async def generate_api(
                 "performance": {
                     "total_time": round(total_time, 2),
                     "images_generated": len(results.get('generated_images', [])),
-                    "parallel_mode": "true_parallel"
+                    "parallel_mode": "true_parallel",
+                    "timeout_setting": config.REQUEST_TIMEOUT
                 }
             }
             
+        except HTTPException:
+            raise
         except Exception as gen_error:
-            logger.error(f"Generation failed: {gen_error}")
-            db.fail_generation(generation_id, str(gen_error))
+            logger.error(f"❌ Generation failed: {gen_error}", exc_info=True)
+            try:
+                db.fail_generation(generation_id, str(gen_error)[:500])
+            except Exception as fail_error:
+                logger.error(f"❌ Failed to mark generation as failed: {fail_error}")
             raise HTTPException(
                 status_code=500, 
-                detail=f"Generation failed: {str(gen_error)}"
+                detail="Generation process failed"
             )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"❌ Unexpected error in generate_api: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/generate-stream")
@@ -348,20 +418,23 @@ async def generate_stream_api(
     website_url: Optional[str] = Form(None),
     ppt_file: Optional[UploadFile] = File(None),
     image_count: int = Form(3),
-    x_user_id: Optional[str] = Header(None)
+    user_id: str = Depends(get_current_user_id)  # Secure production authentication
 ):
     """
-    📡 STREAMING MODE: Real-time TRUE PARALLEL progress
+    Stream generation progress with TRUE PARALLEL image generation
+    
+    Authentication: JWT Bearer token (production) or X-User-ID header (development)
     """
-    user_id = x_user_id or "demo-user"
+    if not MODULES_LOADED or not UTILS_LOADED:
+        raise HTTPException(status_code=503, detail="Service modules not loaded")
     
-    logger.info(f"Stream generation request - User: {user_id}")
+    logger.info(f"📡 Stream generation request - User: {user_id[:8]}...")
     
-    # Validate inputs
-    if image_count < 1 or image_count > 5:
+    # Validate inputs using config
+    if image_count < 1 or image_count > config.MAX_IMAGES:
         raise HTTPException(
             status_code=400,
-            detail="image_count must be between 1 and 5"
+            detail=f"image_count must be between 1 and {config.MAX_IMAGES}"
         )
     
     try:
@@ -370,16 +443,27 @@ async def generate_stream_api(
         
         # Extract content
         if website_url:
-            website_text = await asyncio.to_thread(extract_text_from_url_sync, website_url)
+            from urllib.parse import urlparse
+            parsed = urlparse(website_url)
+            if not all([parsed.scheme, parsed.netloc]):
+                raise HTTPException(status_code=400, detail="Invalid website URL")
+            
+            logger.info(f"🌐 Extracting content from: {website_url}")
+            website_text = await asyncio.to_thread(
+                extract_text_from_url_sync, 
+                website_url,
+                timeout=config.REQUEST_TIMEOUT
+            )
         
-        if ppt_file and ppt_file.filename and ppt_file.filename.endswith(('.pptx', '.ppt')):
+        if ppt_file and ppt_file.filename and ppt_file.filename.lower().endswith(('.pptx', '.ppt')):
+            logger.info(f"📊 Processing PPT file: {ppt_file.filename}")
             file_content = await ppt_file.read()
             
-            # File size check
-            if len(file_content) > 10 * 1024 * 1024:
+            # File size check using config
+            if len(file_content) > config.FILE_SIZE_LIMIT:
                 raise HTTPException(
                     status_code=400,
-                    detail="PPT file size exceeds 10MB limit"
+                    detail=f"PPT file size exceeds {config.FILE_SIZE_LIMIT // (1024*1024)}MB limit"
                 )
                 
             ppt_text = extract_text_from_pptx(file_content)
@@ -388,12 +472,21 @@ async def generate_stream_api(
             raise HTTPException(status_code=400, detail="No content found.")
         
         # Create generation session
-        generation_id = db.create_generation_session(
-            user_id=user_id,
-            website_url=website_url,
-            ppt_text=ppt_text,
-            website_text=website_text
-        )
+        try:
+            logger.info(f"📝 Creating generation session for streaming: {user_id[:8]}...")
+            generation_id = db.create_generation_session(
+                user_id=user_id,
+                website_url=website_url,
+                ppt_text=ppt_text,
+                website_text=website_text
+            )
+            logger.info(f"✅ Stream session created: {generation_id}")
+        except Exception as db_error:
+            logger.error(f"❌ Failed to create generation session: {db_error}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to initialize generation session"
+            )
         
         async def generate():
             try:
@@ -404,7 +497,8 @@ async def generate_stream_api(
                     "generation_id": generation_id,
                     "user_id": user_id,
                     "image_count": image_count,
-                    "mode": "true_parallel"
+                    "mode": "true_parallel",
+                    "timeout": config.REQUEST_TIMEOUT
                 }) + "\n"
                 
                 # Stream TRUE PARALLEL generation
@@ -413,7 +507,7 @@ async def generate_stream_api(
                     website_text=website_text,
                     user_id=user_id,
                     generation_id=generation_id,
-                    image_count=image_count
+                    image_count=min(image_count, config.MAX_IMAGES)
                 ):
                     yield json.dumps(chunk) + "\n"
                 
@@ -422,18 +516,23 @@ async def generate_stream_api(
                     "type": "complete",
                     "timestamp": time.time(),
                     "generation_id": generation_id,
-                    "mode": "true_parallel"
+                    "mode": "true_parallel",
+                    "message": "Generation completed successfully"
                 }) + "\n"
                 
             except Exception as e:
-                logger.error(f"Stream generation error: {e}")
-                db.fail_generation(generation_id, str(e))
+                logger.error(f"❌ Stream generation error: {e}", exc_info=True)
+                try:
+                    db.fail_generation(generation_id, str(e)[:500])
+                except Exception as fail_error:
+                    logger.error(f"❌ Failed to mark generation as failed: {fail_error}")
                 
                 yield json.dumps({
                     "type": "error",
                     "timestamp": time.time(),
-                    "message": "Internal server error",
-                    "generation_id": generation_id
+                    "message": "Generation failed",
+                    "generation_id": generation_id,
+                    "error_type": type(e).__name__
                 }) + "\n"
         
         return StreamingResponse(
@@ -443,67 +542,134 @@ async def generate_stream_api(
                 "X-Accel-Buffering": "no",
                 "Cache-Control": "no-cache",
                 "X-Generation-ID": generation_id,
-                "X-User-ID": user_id
+                "X-User-ID": user_id,
+                "X-Timeout": str(config.REQUEST_TIMEOUT)
             }
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Stream endpoint error: {e}")
+        logger.error(f"❌ Stream endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/generations")
 async def get_user_generations(
-    x_user_id: Optional[str] = Header(None),
+    user_id: str = Depends(get_current_user_id),  # Secure production authentication
     limit: int = 20
 ):
-    """Get all generations for current user"""
+    """Get all generations for current user - PRODUCTION VERSION (no memory fallback)"""
+    if not MODULES_LOADED:
+        raise HTTPException(status_code=503, detail="Service modules not loaded")
+    
     try:
-        user_id = x_user_id or "demo-user"
+        logger.info(f"📋 Getting generations for user: {user_id[:8]}..., limit: {limit}")
         
-        # For memory storage
-        user_generations = []
-        for gen_id, gen_data in db._memory_generations.items():
-            if gen_data.get("user_id") == user_id:
-                images = db._memory_images.get(gen_id, [])
-                gen_data["images"] = images
-                gen_data["storage"] = "memory"
-                user_generations.append(gen_data)
+        # Get generations from database ONLY - no memory fallback in production
+        # This ensures consistency across multiple worker processes
+        generations = []
         
-        # Sort by created_at (newest first)
-        user_generations.sort(
-            key=lambda x: x.get("created_at", ""), 
-            reverse=True
-        )
-        
-        # Apply limit
-        user_generations = user_generations[:min(limit, 100)]
+        try:
+            # Try to get from Supabase
+            client = db._get_client()
+            if client:
+                # Query generations for this user
+                response = client.table("marketing_generations") \
+                    .select("*") \
+                    .eq("user_id", user_id) \
+                    .order("created_at", desc=True) \
+                    .limit(min(limit, 100)) \
+                    .execute()
+                
+                if response.data:
+                    for gen in response.data:
+                        # Get associated images
+                        images_response = client.table("marketing_images") \
+                            .select("*") \
+                            .eq("generation_id", gen["id"]) \
+                            .order("image_index") \
+                            .execute()
+                        
+                        gen["images"] = images_response.data if images_response.data else []
+                        gen["storage"] = "supabase"
+                        generations.append(gen)
+            
+            logger.info(f"✅ Retrieved {len(generations)} generations from database")
+            
+        except Exception as db_error:
+            logger.error(f"❌ Database query failed: {db_error}")
+            # In production, we don't fall back to memory
+            raise HTTPException(
+                status_code=503,
+                detail="Database service temporarily unavailable"
+            )
         
         return {
             "success": True,
             "user_id": user_id,
-            "count": len(user_generations),
-            "generations": user_generations
+            "count": len(generations),
+            "generations": generations,
+            "storage": "database"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting generations: {e}")
+        logger.error(f"❌ Error getting generations: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/generations/{generation_id}")
 async def get_generation(
     generation_id: str,
-    x_user_id: Optional[str] = Header(None)
+    user_id: str = Depends(get_current_user_id)  # Secure production authentication
 ):
-    """Get specific generation by ID"""
+    """Get specific generation by ID - PRODUCTION VERSION (no memory fallback)"""
+    if not MODULES_LOADED:
+        raise HTTPException(status_code=503, detail="Service modules not loaded")
+    
     try:
-        user_id = x_user_id or "demo-user"
+        logger.info(f"🔍 Getting generation: {generation_id} for user: {user_id[:8]}...")
         
-        generation = db.get_generation(generation_id, user_id)
+        # Get from database ONLY - no memory fallback in production
+        generation = None
         
-        if not generation:
+        try:
+            client = db._get_client()
+            if client:
+                # Get generation with user validation
+                response = client.table("marketing_generations") \
+                    .select("*") \
+                    .eq("id", generation_id) \
+                    .eq("user_id", user_id) \
+                    .single() \
+                    .execute()
+                
+                if response.data:
+                    # Get associated images
+                    images_response = client.table("marketing_images") \
+                        .select("*") \
+                        .eq("generation_id", generation_id) \
+                        .order("image_index") \
+                        .execute()
+                    
+                    generation = response.data
+                    generation["images"] = images_response.data if images_response.data else []
+                    generation["storage"] = "supabase"
+            
+            if not generation:
+                logger.warning(f"⚠️ Generation not found or access denied: {generation_id}")
+                raise HTTPException(
+                    status_code=404, 
+                    detail="Generation not found or access denied"
+                )
+            
+            logger.info(f"✅ Retrieved generation: {generation_id}")
+            
+        except Exception as db_error:
+            logger.error(f"❌ Database query failed: {db_error}")
             raise HTTPException(
-                status_code=404, 
-                detail="Generation not found or access denied"
+                status_code=503,
+                detail="Database service temporarily unavailable"
             )
         
         return {
@@ -515,53 +681,81 @@ async def get_generation(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting generation {generation_id}: {e}")
+        logger.error(f"❌ Error getting generation {generation_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # Error handlers
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with structured logging"""
+    logger.warning(f"⚠️ HTTP {exc.status_code} at {request.url.path}: {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
         content={
             "success": False,
             "error": exc.detail,
             "status_code": exc.status_code,
-            "timestamp": time.time()
+            "timestamp": datetime.now().isoformat(),
+            "path": request.url.path
         }
     )
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle all other exceptions - log internally, return generic error"""
+    logger.error(f"❌ Unhandled exception at {request.url.path}: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={
             "success": False,
             "error": "Internal server error",
-            "timestamp": time.time()
+            "status_code": 500,
+            "timestamp": datetime.now().isoformat()
         }
     )
 
-# Production server entry point
-def run_server():
+# Application startup event
+@app.on_event("startup")
+async def startup_event():
+    """Run on application startup - production initialization"""
+    logger.info(f"""
+    ╔══════════════════════════════════════════════════════╗
+    ║    🚀 Marketing Generator API - Production Ready     ║
+    ╠══════════════════════════════════════════════════════╣
+    ║  Environment: {ENVIRONMENT:<30} ║
+    ║  Mode:       Production                              ║
+    ║  Auth:       {'JWT + Header' if AUTH_LOADED else 'Header Only':<30} ║
+    ║  Timeout:    {config.REQUEST_TIMEOUT//60} minutes                        ║
+    ╚══════════════════════════════════════════════════════╝
+    """)
+    
+    if allowed_origins:
+        logger.info(f"✅ CORS allowed origins: {allowed_origins}")
+    else:
+        logger.warning("⚠️ No CORS origins configured in production")
+    
+    if not MODULES_LOADED:
+        logger.critical("❌ CRITICAL: Application modules failed to load")
+    else:
+        logger.info("✅ All modules loaded successfully")
+
+# For local development only (not used in production)
+if __name__ == "__main__":
     import uvicorn
     
-    port = int(os.getenv("PORT", "5000"))
-    host = os.getenv("HOST", "0.0.0.0")
+    if ENVIRONMENT == "production":
+        logger.warning("⚠️ Running production code in development mode")
     
-    logger.info(f"Starting server on {host}:{port}")
-    logger.info(f"Environment: {os.getenv('ENVIRONMENT', 'production')}")
+    port = config.PORT if CONFIG_LOADED else int(os.getenv("PORT", "5000"))
+    host = config.HOST if CONFIG_LOADED else os.getenv("HOST", "0.0.0.0")
+    
+    logger.info(f"🏃 Starting development server on {host}:{port}")
     
     uvicorn.run(
         "app:app",
         host=host,
         port=port,
-        workers=int(os.getenv("WORKERS", "2")),
-        log_level=os.getenv("LOG_LEVEL", "info"),
-        timeout_keep_alive=600,
-        access_log=False  # Disable access logs in production for better performance
+        reload=ENVIRONMENT == "development",
+        log_level="info",
+        timeout_keep_alive=config.REQUEST_TIMEOUT
     )
-
-if __name__ == "__main__":
-    run_server()

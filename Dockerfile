@@ -1,46 +1,42 @@
-FROM python:3.11-slim as builder
+# Use a slim version of Python 3.11 for a smaller, faster image
+FROM python:3.11-slim
 
+# Create a non-root user for security compliance in production
+RUN useradd -m appuser
+
+# Set the working directory
 WORKDIR /app
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
-
-# -----------------------------
-FROM python:3.11-slim as runtime
-
-WORKDIR /app
-
-# Install runtime dependencies only
+# Install essential system dependencies and clean up cache to keep image small
 RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Python packages from builder
-COPY --from=builder /root/.local /root/.local
+# Copy requirements and install dependencies as root to allow caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Make sure scripts in .local are usable
-ENV PATH=/root/.local/bin:$PATH
-
-# Copy application code
+# Copy the rest of the application code
 COPY . .
 
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+# Ensure the application is owned by the non-root user
+RUN chown -R appuser:appuser /app
+
+# Switch to the non-root user
 USER appuser
 
-# Create directories
-RUN mkdir -p local_images && chmod 755 local_images
+# Health check using the PORT environment variable provided by the host
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:$PORT/health || exit 1
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-5000}/health || exit 1
+# Expose the dynamic port (Railway/Render inject this automatically)
+EXPOSE $PORT
 
-# Run with PORT from Render
-CMD ["sh", "-c", "gunicorn app:app --workers ${WORKERS:-2} --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-5000} --timeout 600 --log-level ${LOG_LEVEL:-info}"]
+# Start the application using Gunicorn with Uvicorn workers
+# Note: Workers should be adjusted based on the available CPU (usually 2-4 for small instances)
+CMD ["gunicorn", "app:app", \
+     "--workers=2", \
+     "--worker-class=uvicorn.workers.UvicornWorker", \
+     "--bind=0.0.0.0:$PORT", \
+     "--timeout=600", \
+     "--log-level=info"]
