@@ -1,37 +1,46 @@
 FROM python:3.11-slim
 
-# Create a non-root user for security
-RUN useradd -m appuser
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app && \
+    chown -R appuser:appuser /app
 
 WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
+    gcc \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# Copy requirements first for better caching
+COPY --chown=appuser:appuser requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY --chown=appuser:appuser . .
 
-# FIX: Set execute permissions for the start script
+# Set execute permissions for start script
 RUN chmod +x /app/start.sh
 
-# Ensure the application is owned by the non-root user
-RUN chown -R appuser:appuser /app
-
+# Switch to non-root user
 USER appuser
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:$PORT/health || exit 1
+# Expose port (will be set by environment)
+EXPOSE 5000
 
-EXPOSE $PORT
+# Health check - Fixed to use proper port detection
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-5000}/health || exit 1
 
-CMD ["gunicorn", "app:app", \
-     "--workers=2", \
-     "--worker-class=uvicorn.workers.UvicornWorker", \
-     "--bind=0.0.0.0:$PORT", \
-     "--timeout=600", \
-     "--log-level=info"]
+# Use start.sh script for proper initialization
+CMD ["./start.sh"]
