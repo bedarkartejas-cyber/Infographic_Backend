@@ -80,9 +80,7 @@ class MarketingDB:
                     print(f"⚠️  Supabase insert failed: {e}")
             
             # Fallback to memory
-            self._memory_generations[generation_id] = data
-            print(f"✅ Generation session created in memory: {generation_id}")
-            return generation_id
+            raise HTTPException(status_code=503, detail="Database connection failed. Data cannot be saved.")
             
         except Exception as e:
             print(f"❌ Failed to create generation session: {e}")

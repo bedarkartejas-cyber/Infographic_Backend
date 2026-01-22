@@ -3,6 +3,7 @@ import re
 import json
 import time
 import uuid
+import logging
 from io import BytesIO
 from typing import Optional
 import asyncio
@@ -12,8 +13,20 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.gzip import GZipMiddleware
 from pptx import Presentation
 import requests
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('app.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 from supabase_db import db
 from main import generate_marketing_assets, generate_marketing_assets_stream
@@ -21,21 +34,29 @@ from main import generate_marketing_assets, generate_marketing_assets_stream
 app = FastAPI(
     title="Marketing Generator API",
     description="Generate marketing assets with TRUE PARALLEL image generation",
-    version="3.0.0"
+    version="3.0.0",
+    docs_url="/docs" if os.getenv("ENVIRONMENT") == "development" else None,
+    redoc_url="/redoc" if os.getenv("ENVIRONMENT") == "development" else None,
 )
 
-# Serve local images if needed
-os.makedirs("local_images", exist_ok=True)
-app.mount("/local_images", StaticFiles(directory="local_images"), name="local_images")
+# Production CORS settings
+allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-# --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    max_age=3600,
 )
+
+# Add GZip compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Serve static files in production
+os.makedirs("local_images", exist_ok=True)
+app.mount("/local_images", StaticFiles(directory="local_images"), name="local_images")
 
 # --- CONFIGURATION ---
 TIMEOUT = (10, 60)
@@ -46,6 +67,32 @@ HEADERS = {
         "Chrome/120.0 Safari/537.36"
     )
 }
+
+# Rate limiting (simple in-memory)
+request_counts = {}
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "100"))  # requests per minute
+
+@app.middleware("http")
+async def rate_limit_middleware(request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    current_time = time.time()
+    
+    # Clean old entries
+    request_counts[client_ip] = [
+        t for t in request_counts.get(client_ip, [])
+        if current_time - t < 60
+    ]
+    
+    # Check rate limit
+    if len(request_counts[client_ip]) >= RATE_LIMIT:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Try again in a minute."}
+        )
+    
+    request_counts[client_ip].append(current_time)
+    response = await call_next(request)
+    return response
 
 def extract_text_from_pptx(file_content):
     """Extract text from PPTX file"""
@@ -92,7 +139,7 @@ def extract_text_from_pptx(file_content):
         return "\n\n".join(full_text_output)
 
     except Exception as e:
-        print(f"Error reading PPTX: {e}")
+        logger.error(f"Error reading PPTX: {e}")
         return ""
 
 def extract_text_from_url_sync(url: str):
@@ -117,7 +164,7 @@ def extract_text_from_url_sync(url: str):
         return text.strip()
         
     except Exception as e:
-        print(f"Error scraping URL: {e}")
+        logger.error(f"Error scraping URL: {e}")
         return ""
 
 @app.get("/")
@@ -127,6 +174,7 @@ async def index():
             "message": "🚀 Marketing Generator API v3.0",
             "version": "3.0.0",
             "status": "running",
+            "environment": os.getenv("ENVIRONMENT", "production"),
             "features": [
                 "TRUE PARALLEL image generation",
                 "All images start simultaneously",
@@ -145,25 +193,33 @@ async def index():
                 "GET /api/generations": "Get user's generations",
                 "GET /api/generations/{id}": "Get specific generation"
             },
-            "performance": {
-                "parallel_mode": "TRUE PARALLEL",
-                "timeouts": "None - Let A2E complete naturally",
-                "strategy": "All images start together, wait for all"
-            }
+            "rate_limit": f"{RATE_LIMIT} requests per minute"
         }
     )
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "datetime": datetime.now().isoformat(),
-        "service": "marketing-generator",
-        "version": "3.0.0",
-        "mode": "TRUE_PARALLEL"
-    }
+    try:
+        # Check database connection
+        db_status = "healthy" if db._get_client() else "unhealthy"
+        
+        return {
+            "status": "healthy",
+            "timestamp": time.time(),
+            "datetime": datetime.now().isoformat(),
+            "service": "marketing-generator",
+            "version": "3.0.0",
+            "mode": "TRUE_PARALLEL",
+            "database": db_status,
+            "environment": os.getenv("ENVIRONMENT", "production")
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": str(e)}
+        )
 
 @app.post("/api/generate")
 async def generate_api(
@@ -174,28 +230,31 @@ async def generate_api(
 ):
     """
     🚀 GENERATE MODE: TRUE PARALLEL image generation
-    
-    Features:
-    - All images start SIMULTANEOUSLY
-    - NO TIMEOUTS - Let A2E complete naturally
-    - Brief + Email + All images in parallel
-    - Returns everything at once when complete
-    
-    Parameters:
-    - website_url: Optional website URL to scrape content from
-    - ppt_file: Optional PPTX file upload
-    - image_count: Number of images to generate (1-5)
-    - x_user_id: User identifier (optional)
     """
     start_time = time.time()
     user_id = x_user_id or "demo-user"
     
-    print(f"\n🚀 GENERATION REQUEST (TRUE PARALLEL)")
-    print(f"   User: {user_id}")
-    print(f"   Website: {website_url}")
-    print(f"   PPT File: {ppt_file.filename if ppt_file else 'None'}")
-    print(f"   Images: {image_count}")
-    print(f"   Mode: TRUE PARALLEL (all start together)")
+    logger.info(f"Generation request - User: {user_id}, Images: {image_count}")
+    
+    # Validate inputs
+    if image_count < 1 or image_count > 5:
+        raise HTTPException(
+            status_code=400,
+            detail="image_count must be between 1 and 5"
+        )
+    
+    if not website_url and not ppt_file:
+        raise HTTPException(
+            status_code=400,
+            detail="Either website_url or ppt_file must be provided"
+        )
+    
+    if ppt_file and ppt_file.filename:
+        if not ppt_file.filename.lower().endswith(('.pptx', '.ppt')):
+            raise HTTPException(
+                status_code=400,
+                detail="Only PPTX/PPT files are supported"
+            )
     
     website_text = ""
     ppt_text = ""
@@ -203,21 +262,33 @@ async def generate_api(
     try:
         # Extract website content
         if website_url:
-            print(f"   Scraping website: {website_url}")
+            from urllib.parse import urlparse
+            parsed = urlparse(website_url)
+            if not all([parsed.scheme, parsed.netloc]):
+                raise HTTPException(status_code=400, detail="Invalid website URL")
+                    
             website_text = await asyncio.to_thread(extract_text_from_url_sync, website_url)
-            print(f"   Website text length: {len(website_text)} chars")
+            logger.info(f"Extracted {len(website_text)} chars from website")
         
         # Extract PPT content
-        if ppt_file and ppt_file.filename and ppt_file.filename.endswith(('.pptx', '.ppt')):
-            print(f"   Processing PPT file: {ppt_file.filename}")
+        if ppt_file and ppt_file.filename:
+            logger.info(f"Processing PPT file: {ppt_file.filename}")
             file_content = await ppt_file.read()
+            
+            # File size check (10MB max)
+            if len(file_content) > 10 * 1024 * 1024:
+                raise HTTPException(
+                    status_code=400,
+                    detail="PPT file size exceeds 10MB limit"
+                )
+                
             ppt_text = extract_text_from_pptx(file_content)
-            print(f"   PPT text length: {len(ppt_text)} chars")
+            logger.info(f"Extracted {len(ppt_text)} chars from PPT")
         
         if not ppt_text and not website_text:
             raise HTTPException(
                 status_code=400, 
-                detail="No content found. Please provide a valid PPTX file or Website URL."
+                detail="No content found in the provided sources"
             )
         
         # Create generation session
@@ -228,30 +299,22 @@ async def generate_api(
             website_text=website_text
         )
         
-        print(f"   Generation ID: {generation_id}")
-        print(f"   Strategy: ALL {image_count} IMAGES START TOGETHER")
+        logger.info(f"Starting TRUE PARALLEL generation: {generation_id}")
         
         try:
-            # Limit image count for sanity
-            actual_image_count = min(max(1, image_count), 5)
-            if actual_image_count != image_count:
-                print(f"   ⚠️  Adjusted image count to {actual_image_count} (max 5)")
-            
             # Run TRUE PARALLEL generation
             results = await generate_marketing_assets(
                 ppt_text=ppt_text,
                 website_text=website_text,
                 user_id=user_id,
                 generation_id=generation_id,
-                image_count=actual_image_count
+                image_count=image_count
             )
             
             total_time = time.time() - start_time
             results["generation_time"] = round(total_time, 2)
             
-            print(f"✅ TRUE PARALLEL generation completed in {total_time:.0f}s")
-            print(f"   Images generated: {len(results.get('generated_images', []))}")
-            print(f"   Parallel mode: ✅ All images started together")
+            logger.info(f"Generation completed in {total_time:.0f}s: {generation_id}")
             
             return {
                 "success": True,
@@ -262,15 +325,12 @@ async def generate_api(
                 "performance": {
                     "total_time": round(total_time, 2),
                     "images_generated": len(results.get('generated_images', [])),
-                    "parallel_mode": "true_parallel",
-                    "timeouts": "none",
-                    "strategy": "All images started simultaneously"
+                    "parallel_mode": "true_parallel"
                 }
             }
             
         except Exception as gen_error:
-            # Mark generation as failed
-            print(f"❌ Generation failed: {gen_error}")
+            logger.error(f"Generation failed: {gen_error}")
             db.fail_generation(generation_id, str(gen_error))
             raise HTTPException(
                 status_code=500, 
@@ -280,8 +340,8 @@ async def generate_api(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/generate-stream")
 async def generate_stream_api(
@@ -292,32 +352,17 @@ async def generate_stream_api(
 ):
     """
     📡 STREAMING MODE: Real-time TRUE PARALLEL progress
-    
-    Returns NDJSON stream with events:
-    - start: Generation started
-    - brief: Marketing brief ready
-    - email: Email copy ready  
-    - image_start: Image generation starting (ALL START TOGETHER)
-    - image: Individual image ready
-    - complete: All done
-    
-    Features:
-    - All images start SIMULTANEOUSLY
-    - No timeouts
-    - Real-time progress updates
-    
-    Parameters:
-    - website_url: Optional website URL
-    - ppt_file: Optional PPTX file
-    - image_count: Number of images (1-5)
-    - x_user_id: User identifier
     """
     user_id = x_user_id or "demo-user"
     
-    print(f"\n📡 STREAMING REQUEST (TRUE PARALLEL)")
-    print(f"   User: {user_id}")
-    print(f"   Images: {image_count}")
-    print(f"   Mode: TRUE PARALLEL STREAMING")
+    logger.info(f"Stream generation request - User: {user_id}")
+    
+    # Validate inputs
+    if image_count < 1 or image_count > 5:
+        raise HTTPException(
+            status_code=400,
+            detail="image_count must be between 1 and 5"
+        )
     
     try:
         website_text = ""
@@ -329,6 +374,14 @@ async def generate_stream_api(
         
         if ppt_file and ppt_file.filename and ppt_file.filename.endswith(('.pptx', '.ppt')):
             file_content = await ppt_file.read()
+            
+            # File size check
+            if len(file_content) > 10 * 1024 * 1024:
+                raise HTTPException(
+                    status_code=400,
+                    detail="PPT file size exceeds 10MB limit"
+                )
+                
             ppt_text = extract_text_from_pptx(file_content)
         
         if not ppt_text and not website_text:
@@ -342,9 +395,6 @@ async def generate_stream_api(
             website_text=website_text
         )
         
-        # Adjust image count
-        actual_image_count = min(max(1, image_count), 5)
-        
         async def generate():
             try:
                 # Send start event
@@ -353,9 +403,8 @@ async def generate_stream_api(
                     "timestamp": time.time(),
                     "generation_id": generation_id,
                     "user_id": user_id,
-                    "image_count": actual_image_count,
-                    "mode": "true_parallel",
-                    "message": "Starting TRUE PARALLEL generation (all images start together)..."
+                    "image_count": image_count,
+                    "mode": "true_parallel"
                 }) + "\n"
                 
                 # Stream TRUE PARALLEL generation
@@ -364,7 +413,7 @@ async def generate_stream_api(
                     website_text=website_text,
                     user_id=user_id,
                     generation_id=generation_id,
-                    image_count=actual_image_count
+                    image_count=image_count
                 ):
                     yield json.dumps(chunk) + "\n"
                 
@@ -373,21 +422,18 @@ async def generate_stream_api(
                     "type": "complete",
                     "timestamp": time.time(),
                     "generation_id": generation_id,
-                    "mode": "true_parallel",
-                    "message": "TRUE PARALLEL generation completed! All images started together."
+                    "mode": "true_parallel"
                 }) + "\n"
                 
             except Exception as e:
-                # Mark as failed
+                logger.error(f"Stream generation error: {e}")
                 db.fail_generation(generation_id, str(e))
                 
-                # Send error
                 yield json.dumps({
                     "type": "error",
                     "timestamp": time.time(),
-                    "message": str(e),
-                    "generation_id": generation_id,
-                    "mode": "true_parallel"
+                    "message": "Internal server error",
+                    "generation_id": generation_id
                 }) + "\n"
         
         return StreamingResponse(
@@ -397,13 +443,13 @@ async def generate_stream_api(
                 "X-Accel-Buffering": "no",
                 "Cache-Control": "no-cache",
                 "X-Generation-ID": generation_id,
-                "X-User-ID": user_id,
-                "X-Mode": "true_parallel"
+                "X-User-ID": user_id
             }
         )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Stream endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/generations")
 async def get_user_generations(
@@ -418,7 +464,6 @@ async def get_user_generations(
         user_generations = []
         for gen_id, gen_data in db._memory_generations.items():
             if gen_data.get("user_id") == user_id:
-                # Get images for this generation
                 images = db._memory_images.get(gen_id, [])
                 gen_data["images"] = images
                 gen_data["storage"] = "memory"
@@ -431,18 +476,18 @@ async def get_user_generations(
         )
         
         # Apply limit
-        user_generations = user_generations[:limit]
+        user_generations = user_generations[:min(limit, 100)]
         
         return {
             "success": True,
             "user_id": user_id,
             "count": len(user_generations),
-            "generations": user_generations,
-            "mode": "true_parallel"
+            "generations": user_generations
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting generations: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/generations/{generation_id}")
 async def get_generation(
@@ -458,20 +503,20 @@ async def get_generation(
         if not generation:
             raise HTTPException(
                 status_code=404, 
-                detail=f"Generation {generation_id} not found or access denied"
+                detail="Generation not found or access denied"
             )
         
         return {
             "success": True,
             "generation": generation,
-            "storage": generation.get("storage", "unknown"),
-            "mode": "true_parallel"
+            "storage": generation.get("storage", "unknown")
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting generation {generation_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # Error handlers
 @app.exception_handler(HTTPException)
@@ -488,43 +533,35 @@ async def http_exception_handler(request, exc):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={
             "success": False,
-            "error": str(exc),
-            "type": type(exc).__name__,
+            "error": "Internal server error",
             "timestamp": time.time()
         }
     )
 
-if __name__ == "__main__":
+# Production server entry point
+def run_server():
     import uvicorn
     
-    print("\n" + "="*60)
-    print("🚀 MARKETING GENERATOR API v3.0 - TRUE PARALLEL")
-    print("="*60)
-    print("Core Features:")
-    print("  • TRUE PARALLEL image generation")
-    print("  • ALL images start SIMULTANEOUSLY")
-    print("  • NO TIMEOUTS - Let A2E complete naturally")
-    print("  • Wait for all images to finish")
-    print("="*60)
-    print("Endpoints:")
-    print("  • POST /api/generate - All at once (TRUE PARALLEL)")
-    print("  • POST /api/generate-stream - Stream progress (TRUE PARALLEL)")
-    print("="*60)
-    print(f"Starting server at {datetime.now().strftime('%H:%M:%S')}")
-    print("="*60)
+    port = int(os.getenv("PORT", "5000"))
+    host = os.getenv("HOST", "0.0.0.0")
     
-    # Create required directories
-    os.makedirs("local_images", exist_ok=True)
+    logger.info(f"Starting server on {host}:{port}")
+    logger.info(f"Environment: {os.getenv('ENVIRONMENT', 'production')}")
     
     uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=5000, 
-        reload=True,
-        log_level="info",
-        timeout_keep_alive=600  # Longer timeout for parallel processing
+        "app:app",
+        host=host,
+        port=port,
+        workers=int(os.getenv("WORKERS", "2")),
+        log_level=os.getenv("LOG_LEVEL", "info"),
+        timeout_keep_alive=600,
+        access_log=False  # Disable access logs in production for better performance
     )
+
+if __name__ == "__main__":
+    run_server()
