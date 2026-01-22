@@ -1,9 +1,6 @@
-# Production dependencies
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 gunicorn==21.2.0
-
-# Core functionality
 python-pptx==0.6.23
 beautifulsoup4==4.12.2
 requests==2.31.0
@@ -11,8 +8,5 @@ openai==0.28.1
 python-dotenv==1.0.0
 supabase==1.1.1
 python-multipart==0.0.6
-
-# Security & utilities
 PyJWT==2.8.0
-httpx==0.25.1
 aiohttp==3.9.1
